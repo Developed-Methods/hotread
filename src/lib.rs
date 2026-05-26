@@ -19,6 +19,13 @@ pub struct HotRead<T>
 where
     T: HotReadState,
 {
+    inner: Arc<HotReadInner<T>>,
+}
+
+struct HotReadInner<T>
+where
+    T: HotReadState,
+{
     copies: [CopySlot<T>; 2],
     generation: AtomicU64,
     state: Mutex<UpdateState<T::Action>>,
@@ -45,11 +52,11 @@ struct QueuedUpdate<U> {
     update: U,
 }
 
-pub struct HotReadHandle<'a, T>
+pub struct HotReadHandle<T>
 where
     T: HotReadState,
 {
-    owner: &'a HotRead<T>,
+    owner: Arc<HotReadInner<T>>,
     slot: Arc<WorkerSlot>,
     generation: u64,
 }
@@ -71,7 +78,18 @@ pub struct MaintenanceResult {
     pub blocked_by_workers: bool,
 }
 
-unsafe impl<T> Sync for HotRead<T> where T: HotReadState {}
+impl<T> Clone for HotRead<T>
+where
+    T: HotReadState,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+unsafe impl<T> Sync for HotReadInner<T> where T: HotReadState {}
 
 impl<T> HotRead<T>
 where
@@ -79,33 +97,35 @@ where
 {
     pub fn new(initial: T) -> Self {
         Self {
-            copies: [
-                CopySlot {
-                    value: UnsafeCell::new(initial.clone()),
-                    applied_seq: AtomicU64::new(0),
-                },
-                CopySlot {
-                    value: UnsafeCell::new(initial),
-                    applied_seq: AtomicU64::new(0),
-                },
-            ],
-            generation: AtomicU64::new(0),
-            state: Mutex::new(UpdateState {
-                log: VecDeque::new(),
-                next_seq: 1,
+            inner: Arc::new(HotReadInner {
+                copies: [
+                    CopySlot {
+                        value: UnsafeCell::new(initial.clone()),
+                        applied_seq: AtomicU64::new(0),
+                    },
+                    CopySlot {
+                        value: UnsafeCell::new(initial),
+                        applied_seq: AtomicU64::new(0),
+                    },
+                ],
+                generation: AtomicU64::new(0),
+                state: Mutex::new(UpdateState {
+                    log: VecDeque::new(),
+                    next_seq: 1,
+                }),
+                workers: Mutex::new(Vec::new()),
             }),
-            workers: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn create_handle(&self) -> HotReadHandle<'_, T> {
+    pub fn create_handle(&self) -> HotReadHandle<T> {
         let slot = Arc::new(WorkerSlot {
             generation: AtomicU64::new(QUIESCENT_GENERATION),
         });
-        self.workers.lock().push(Arc::downgrade(&slot));
+        self.inner.workers.lock().push(Arc::downgrade(&slot));
 
         HotReadHandle {
-            owner: self,
+            owner: self.inner.clone(),
             slot,
             generation: QUIESCENT_GENERATION,
         }
@@ -119,7 +139,7 @@ where
     where
         I: IntoIterator<Item = T::Action>,
     {
-        let mut state = self.state.lock();
+        let mut state = self.inner.state.lock();
         let first_seq = state.next_seq;
         let mut last_seq = first_seq.saturating_sub(1);
         let mut queued_updates = 0;
@@ -155,7 +175,7 @@ where
     }
 
     pub fn maintain(&self) -> MaintenanceResult {
-        let mut state = self.state.lock();
+        let mut state = self.inner.state.lock();
         let offline = self.offline_index();
 
         if !self.workers_caught_up_to_published() {
@@ -183,19 +203,19 @@ where
     }
 
     pub fn latest_seq(&self) -> u64 {
-        self.state.lock().next_seq.saturating_sub(1)
+        self.inner.state.lock().next_seq.saturating_sub(1)
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.inner.generation.load(Ordering::Acquire)
     }
 
     pub fn copy_applied_seq(&self, index: usize) -> u64 {
-        self.copies[index].applied_seq.load(Ordering::Acquire)
+        self.inner.copies[index].applied_seq.load(Ordering::Acquire)
     }
 
     pub fn queued_update_count(&self) -> usize {
-        self.state.lock().log.len()
+        self.inner.state.lock().log.len()
     }
 
     fn offline_index(&self) -> usize {
@@ -212,7 +232,7 @@ where
 
     fn apply_to_copy_locked(&self, index: usize, state: &UpdateState<T::Action>) -> (usize, bool) {
         let mut applied = 0;
-        let mut applied_seq = self.copies[index].applied_seq.load(Ordering::Acquire);
+        let mut applied_seq = self.inner.copies[index].applied_seq.load(Ordering::Acquire);
 
         for queued in &state.log {
             if queued.seq <= applied_seq {
@@ -220,36 +240,36 @@ where
             }
 
             // SAFETY: caller holds state, this copy is inactive, and worker slots were checked.
-            let copy = unsafe { &mut *self.copies[index].value.get() };
+            let copy = unsafe { &mut *self.inner.copies[index].value.get() };
             copy.apply_update(&queued.update);
             applied_seq = queued.seq;
             applied += 1;
         }
 
-        self.copies[index]
+        self.inner.copies[index]
             .applied_seq
             .store(applied_seq, Ordering::Release);
 
         let latest_seq = state.next_seq.saturating_sub(1);
         let ready_to_publish = applied_seq == latest_seq && latest_seq != self.active_applied_seq();
         if ready_to_publish {
-            self.generation.fetch_add(1, Ordering::Release);
+            self.inner.generation.fetch_add(1, Ordering::Release);
         }
 
         (applied, ready_to_publish)
     }
 
     fn active_applied_seq(&self) -> u64 {
-        self.copies[self.active_index()]
+        self.inner.copies[self.active_index()]
             .applied_seq
             .load(Ordering::Acquire)
     }
 
     fn prune_locked(&self, state: &mut UpdateState<T::Action>) -> usize {
-        let min_applied = self.copies[0]
+        let min_applied = self.inner.copies[0]
             .applied_seq
             .load(Ordering::Acquire)
-            .min(self.copies[1].applied_seq.load(Ordering::Acquire));
+            .min(self.inner.copies[1].applied_seq.load(Ordering::Acquire));
         let before = state.log.len();
 
         while state
@@ -265,7 +285,7 @@ where
 
     fn workers_caught_up_to_published(&self) -> bool {
         let generation = self.generation();
-        let mut workers = self.workers.lock();
+        let mut workers = self.inner.workers.lock();
         let mut caught_up = true;
 
         workers.retain(|worker| {
@@ -286,7 +306,7 @@ where
 
     #[cfg(test)]
     fn worker_generation_count(&self, generation: u64) -> usize {
-        let mut workers = self.workers.lock();
+        let mut workers = self.inner.workers.lock();
         let mut count = 0;
 
         workers.retain(|worker| {
@@ -309,18 +329,18 @@ where
     }
 }
 
-impl<T> HotReadHandle<'_, T>
+impl<T> HotReadHandle<T>
 where
     T: HotReadState,
 {
     pub fn current(&mut self) -> &T {
         loop {
-            let generation = self.owner.generation();
+            let generation = self.owner.generation.load(Ordering::Acquire);
 
             self.slot.generation.store(generation, Ordering::Release);
             self.generation = generation;
 
-            if self.owner.generation() != generation {
+            if self.owner.generation.load(Ordering::Acquire) != generation {
                 continue;
             }
 
@@ -351,7 +371,7 @@ where
     }
 }
 
-impl<T> Drop for HotReadHandle<'_, T>
+impl<T> Drop for HotReadHandle<T>
 where
     T: HotReadState,
 {
@@ -533,6 +553,21 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn handle_can_move_to_thread_without_borrowing_owner() {
+        let published = HotRead::<TestTable>::new(TestTable::default());
+        published.queue_update(TestUpdate::Set(1, 10));
+        let mut worker = published.create_handle();
+
+        drop(published);
+
+        std::thread::spawn(move || {
+            assert_eq!(worker.current().values.get(&1), Some(&10));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
