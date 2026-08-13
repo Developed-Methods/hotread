@@ -1,7 +1,7 @@
 use std::{
     cell::UnsafeCell,
     collections::VecDeque,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering, fence},
     sync::{Arc, Weak},
 };
 
@@ -285,6 +285,11 @@ where
 
     fn workers_caught_up_to_published(&self) -> bool {
         let generation = self.generation();
+
+        // Paired with the fence in current so maintenance cannot observe the worker's previous
+        // generation while the reader observes the previous published generation.
+        fence(Ordering::SeqCst);
+
         let mut workers = self.inner.workers.lock();
         let mut caught_up = true;
 
@@ -339,6 +344,10 @@ where
 
             self.slot.generation.store(generation, Ordering::Release);
             self.generation = generation;
+
+            // Orders the worker generation store before rechecking the published generation;
+            // paired with the fence before the worker scan.
+            fence(Ordering::SeqCst);
 
             if self.owner.generation.load(Ordering::Acquire) != generation {
                 continue;
